@@ -37,6 +37,11 @@ def validate_schedule(sigmas: torch.Tensor) -> None:
         raise ValueError("Blueprint sigma schedule must be finite.")
     if float(values[-1]) != 0.0:
         raise ValueError("Blueprint sigma schedule must terminate at exactly zero.")
+    if float(values[0]) != 1.0:
+        raise ValueError(
+            "Blueprint first slice requires sigma[0] exactly 1.0; partial "
+            "denoise schedules are unsupported."
+        )
     if bool((values[:-1] <= 0.0).any()) or bool((values[1:] >= values[:-1]).any()):
         raise ValueError("Blueprint sigmas must be positive then strictly decreasing.")
 
@@ -213,6 +218,11 @@ class BlueprintEulerSampler(comfy.samplers.Sampler):
         if getattr(noise, "is_nested", False) or getattr(latent_image, "is_nested", False):
             raise ValueError("Blueprint first slice does not support nested latents.")
         validate_schedule(sigmas)
+        if not self.max_denoise(model, sigmas):
+            raise ValueError(
+                "Blueprint first slice requires a full-denoise schedule starting "
+                "at the model's maximum sigma; partial denoise is unsupported."
+            )
         model_sampling = model.inner_model.model_sampling
         if "CONST" not in {item.__name__ for item in type(model_sampling).__mro__}:
             raise ValueError("Blueprint first slice requires CONST flow sampling.")
