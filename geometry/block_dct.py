@@ -6,11 +6,23 @@ import torch
 
 
 class BlockDCTGeometry:
-    HIGH_HW = (32, 64)
-    GLOBAL_HW = (24, 48)
     BLOCK_HIGH = 4
     BLOCK_GLOBAL = 3
     TOLERANCE = 2e-6
+
+    def __init__(self, high_hw: tuple[int, int]) -> None:
+        self.HIGH_HW = tuple(int(value) for value in high_hw)
+        if len(self.HIGH_HW) != 2 or any(value <= 0 for value in self.HIGH_HW):
+            raise ValueError(f"Blueprint requires positive target geometry, got {high_hw}.")
+        if any(value % self.BLOCK_HIGH for value in self.HIGH_HW):
+            raise ValueError(
+                "Blueprint target latent axes must both be divisible by 4, got "
+                f"{self.HIGH_HW}."
+            )
+        self.GLOBAL_HW = tuple(
+            value // self.BLOCK_HIGH * self.BLOCK_GLOBAL
+            for value in self.HIGH_HW
+        )
 
     @staticmethod
     def _matrix(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

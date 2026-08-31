@@ -48,7 +48,7 @@ def validate_schedule(sigmas: torch.Tensor) -> None:
 
 class BlueprintCoordinator:
     def __init__(self, *, capture: TensorCapture | None = None) -> None:
-        self.geometry = BlockDCTGeometry()
+        self.geometry: BlockDCTGeometry | None = None
         self.planner = FixedCropPlanner()
         self.assembler = OverlapAssembler()
         self.policy = HardNonterminalTerminalRelease()
@@ -62,7 +62,9 @@ class BlueprintCoordinator:
             self.capture(name, ordinal, value)
 
     def initialize(self, h: torch.Tensor, sigma: torch.Tensor) -> BlueprintState:
+        self.geometry = BlockDCTGeometry(tuple(h.shape[-2:]))
         self.geometry.validate_high(h)
+        self.planner.plan(tuple(h.shape[-2:]))
         error = self.geometry.qualify(device=h.device, dtype=h.dtype)
         g = self.geometry.restrict(h)
         self._capture("initial_H", -1, h)
@@ -85,6 +87,8 @@ class BlueprintCoordinator:
         model_options: dict[str, Any],
         seed: int,
     ) -> tuple[BlueprintState, torch.Tensor]:
+        if self.geometry is None:
+            raise RuntimeError("Blueprint coordinator must be initialized before evaluation.")
         ordinal = state.ordinal
         sigma_value = float(sigma)
         sigma_next_value = float(sigma_next)
@@ -108,7 +112,7 @@ class BlueprintCoordinator:
             guider=guider,
             g=state.g,
             sigma=sigma,
-            canvas=self.geometry.HIGH_HW,
+            canvas=tuple(state.h.shape[-2:]),
             model_options=model_options,
             seed=seed,
         )
@@ -121,7 +125,7 @@ class BlueprintCoordinator:
                 guider=guider,
                 h_view=view,
                 sigma=sigma,
-                canvas=self.geometry.HIGH_HW,
+                canvas=tuple(state.h.shape[-2:]),
                 region=region,
                 model_options=model_options,
                 seed=seed,
@@ -130,7 +134,7 @@ class BlueprintCoordinator:
             raise RuntimeError("A Blueprint model call mutated accepted state.")
 
         x0_h, coverage = self.assembler.assemble(
-            local_predictions, regions, self.geometry.HIGH_HW
+            local_predictions, regions, tuple(state.h.shape[-2:])
         )
         dt = sigma_next - sigma
         g_star = state.g + (state.g - x0_g) / sigma * dt

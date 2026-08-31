@@ -23,19 +23,35 @@ class Region:
 
 
 class FixedCropPlanner:
-    TARGET_HW = (32, 64)
-    REGIONS = (
-        Region(0, 0, 0),
-        Region(1, 0, 24),
-        Region(2, 0, 32),
-    )
+    CROP_SIZE = 32
+    STRIDE = 24
+
+    @classmethod
+    def _starts(cls, length: int) -> tuple[int, ...]:
+        if length < cls.CROP_SIZE:
+            raise ValueError(
+                "Blueprint target latent axes must be at least 32 for 32x32 "
+                f"crops, got {length}."
+            )
+        final = length - cls.CROP_SIZE
+        starts = list(range(0, final + 1, cls.STRIDE))
+        if starts[-1] != final:
+            starts.append(final)
+        return tuple(starts)
 
     def plan(self, target_hw: tuple[int, int]) -> tuple[Region, ...]:
-        if tuple(target_hw) != self.TARGET_HW:
+        target_hw = tuple(int(value) for value in target_hw)
+        if len(target_hw) != 2 or any(value % 4 for value in target_hw):
             raise ValueError(
-                f"Blueprint fixed planner requires {self.TARGET_HW}, got {target_hw}."
+                "Blueprint target latent axes must both be divisible by 4, got "
+                f"{target_hw}."
             )
-        return self.REGIONS
+        ys = self._starts(target_hw[0])
+        xs = self._starts(target_hw[1])
+        return tuple(
+            Region(index, y, x)
+            for index, (y, x) in enumerate((y, x) for y in ys for x in xs)
+        )
 
 
 class OverlapAssembler:
@@ -91,8 +107,10 @@ class OverlapAssembler:
         regions: tuple[Region, ...],
         target_hw: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if len(predictions) != 3 or len(regions) != 3:
-            raise ValueError("Blueprint requires exactly three crop predictions.")
+        if not predictions or len(predictions) != len(regions):
+            raise ValueError(
+                "Blueprint requires one prediction for every planned crop."
+            )
         first = predictions[0]
         output = torch.zeros(
             (first.shape[0], first.shape[1], *target_hw),
@@ -105,6 +123,10 @@ class OverlapAssembler:
             device=first.device,
         )
         for prediction, region in zip(predictions, regions):
+            if region.y < 0 or region.x < 0 or region.y2 > target_hw[0] or region.x2 > target_hw[1]:
+                raise ValueError(
+                    f"Crop {region.index} lies outside target grid {target_hw}."
+                )
             expected = (region.height, region.width)
             if tuple(prediction.shape[-2:]) != expected:
                 raise ValueError(

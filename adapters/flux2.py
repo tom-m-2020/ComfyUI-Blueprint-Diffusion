@@ -46,10 +46,14 @@ class Flux2Adapter:
         ):
             name = type(diffusion_model).__name__ if diffusion_model is not None else "None"
             raise ValueError(f"Blueprint requires the FLUX.2 coordinate backend, got {name}.")
-        if tuple(high_shape[-2:]) != (32, 64) or tuple(global_shape[-2:]) != (24, 48):
-            raise ValueError("Blueprint FLUX.2 adapter received unsupported geometry.")
-        if len(crops) != 3:
-            raise ValueError("Blueprint FLUX.2 adapter requires exactly three crops.")
+        high_hw = tuple(high_shape[-2:])
+        expected_global = tuple(value // 4 * 3 for value in high_hw)
+        if any(value % 4 for value in high_hw) or tuple(global_shape[-2:]) != expected_global:
+            raise ValueError(
+                "Blueprint FLUX.2 adapter received incompatible high/global geometry."
+            )
+        if not crops:
+            raise ValueError("Blueprint FLUX.2 adapter requires planned crops.")
         if latent.ndim != 4 or latent.shape[0] != 1:
             raise ValueError("Blueprint FLUX.2 adapter requires one 4-D image latent.")
         unsupported_entry_keys = {"area", "mask", "control", "gligen"}
