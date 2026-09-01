@@ -11,8 +11,8 @@ class BlueprintCandidate3EulerSampler:
     FUNCTION = "build"
     CATEGORY = "sampling/custom_sampling/samplers"
     DESCRIPTION = (
-        "Fail-closed Candidate-3 Euler sampler for the qualified native "
-        "FLUX.2 Klein CFG-1 T2I contract and compatible target geometry. "
+        "Fail-closed variable-step Candidate-3 Euler sampler for the qualified "
+        "native FLUX.2 Klein CFG-1 full-denoise T2I contract and compatible geometry. "
         "Use with SamplerCustomAdvanced."
     )
 

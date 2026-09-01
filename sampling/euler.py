@@ -30,8 +30,8 @@ def _summary(value: torch.Tensor) -> dict[str, Any]:
 
 
 def validate_schedule(sigmas: torch.Tensor) -> None:
-    if sigmas.ndim != 1 or sigmas.numel() != 5:
-        raise ValueError("Blueprint first slice requires exactly four Euler intervals.")
+    if sigmas.ndim != 1 or sigmas.numel() < 2:
+        raise ValueError("Blueprint requires at least one Euler interval.")
     values = sigmas.detach().float().cpu()
     if not bool(torch.isfinite(values).all()):
         raise ValueError("Blueprint sigma schedule must be finite.")
@@ -108,14 +108,17 @@ class BlueprintCoordinator:
 
         accepted_h_snapshot = state.h.clone()
         accepted_g_snapshot = state.g.clone()
-        x0_g = self.adapter.predict_global(
-            guider=guider,
-            g=state.g,
-            sigma=sigma,
-            canvas=tuple(state.h.shape[-2:]),
-            model_options=model_options,
-            seed=seed,
-        )
+        terminal = sigma_next_value == 0.0
+        x0_g = None
+        if not terminal:
+            x0_g = self.adapter.predict_global(
+                guider=guider,
+                g=state.g,
+                sigma=sigma,
+                canvas=tuple(state.h.shape[-2:]),
+                model_options=model_options,
+                seed=seed,
+            )
         local_predictions = []
         for region in regions:
             view = state.h[:, :, region.y:region.y2, region.x:region.x2]
@@ -137,20 +140,30 @@ class BlueprintCoordinator:
             local_predictions, regions, tuple(state.h.shape[-2:])
         )
         dt = sigma_next - sigma
-        g_star = state.g + (state.g - x0_g) / sigma * dt
         h_star = state.h + (state.h - x0_h) / sigma * dt
-        acceptance = self.policy.accept(
-            g_star=g_star,
-            h_star=h_star,
-            sigma_next=sigma_next_value,
-            geometry=self.geometry,
-        )
+        g_star = None
+        if terminal:
+            acceptance = self.policy.accept_terminal(
+                retained_g=state.g,
+                h_star=h_star,
+                sigma_next=sigma_next_value,
+            )
+        else:
+            g_star = state.g + (state.g - x0_g) / sigma * dt
+            acceptance = self.policy.accept(
+                g_star=g_star,
+                h_star=h_star,
+                sigma_next=sigma_next_value,
+                geometry=self.geometry,
+            )
 
-        for name, value in (
-            ("x0_G", x0_g), ("assembled_x0_H", x0_h),
-            ("G_star", g_star), ("H_star", h_star),
+        captured = [
+            ("assembled_x0_H", x0_h), ("H_star", h_star),
             ("accepted_G", acceptance.g), ("accepted_H", acceptance.h),
-        ):
+        ]
+        if not terminal:
+            captured[0:0] = [("x0_G", x0_g), ("G_star", g_star)]
+        for name, value in captured:
             if not bool(torch.isfinite(value).all()):
                 raise RuntimeError(f"Blueprint produced nonfinite {name} at {ordinal}.")
             self._capture(name, ordinal, value)
@@ -186,8 +199,15 @@ class BlueprintCoordinator:
             "sigma": sigma_value,
             "sigma_next": sigma_next_value,
             "terminal_release": acceptance.terminal_release,
-            "model_predictions": work.model_predictions,
+            "global_forward_performed": not terminal,
+            "terminal_global_unused": terminal,
+            "global_synchronized": acceptance.global_synchronized,
+            "global_state_status": (
+                "retained_preterminal_unsynchronized" if terminal else "synchronized"
+            ),
+            "model_predictions": work.model_predictions - int(terminal),
             "global_tokens": work.global_tokens,
+            "executed_global_tokens": 0 if terminal else work.global_tokens,
             "local_tokens": work.local_tokens,
             "coverage_min": float(coverage.min()),
             "coverage_max": float(coverage.max()),
@@ -215,6 +235,7 @@ class BlueprintEulerSampler(comfy.samplers.Sampler):
         denoise_mask=None,
         disable_pbar=False,
     ):
+        self.last_telemetry = ()
         if denoise_mask is not None:
             raise ValueError("Blueprint first slice does not support masks.")
         if latent_image is None or bool(torch.count_nonzero(latent_image)):
