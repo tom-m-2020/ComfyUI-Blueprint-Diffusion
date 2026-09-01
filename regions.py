@@ -25,16 +25,20 @@ class Region:
 class FixedCropPlanner:
     CROP_SIZE = 32
     STRIDE = 24
+    QUALIFIED_GEOMETRIES = {
+        (64, 128): (64, 48),
+        (48, 96): (48, 36),
+    }
 
-    @classmethod
-    def _starts(cls, length: int) -> tuple[int, ...]:
-        if length < cls.CROP_SIZE:
+    @staticmethod
+    def _starts(length: int, crop_size: int = 32, stride: int = 24) -> tuple[int, ...]:
+        if length < crop_size:
             raise ValueError(
-                "Blueprint target latent axes must be at least 32 for 32x32 "
-                f"crops, got {length}."
+                f"Blueprint target latent axis {length} cannot fit the qualified "
+                f"{crop_size}x{crop_size} local crop."
             )
-        final = length - cls.CROP_SIZE
-        starts = list(range(0, final + 1, cls.STRIDE))
+        final = length - crop_size
+        starts = list(range(0, final + 1, stride))
         if starts[-1] != final:
             starts.append(final)
         return tuple(starts)
@@ -46,10 +50,13 @@ class FixedCropPlanner:
                 "Blueprint target latent axes must both be divisible by 4, got "
                 f"{target_hw}."
             )
-        ys = self._starts(target_hw[0])
-        xs = self._starts(target_hw[1])
+        crop_size, stride = self.QUALIFIED_GEOMETRIES.get(
+            target_hw, (self.CROP_SIZE, self.STRIDE)
+        )
+        ys = self._starts(target_hw[0], crop_size, stride)
+        xs = self._starts(target_hw[1], crop_size, stride)
         return tuple(
-            Region(index, y, x)
+            Region(index, y, x, crop_size, crop_size)
             for index, (y, x) in enumerate((y, x) for y in ys for x in xs)
         )
 
