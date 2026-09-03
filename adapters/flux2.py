@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from .base import WorkEstimate
+from .base import RegionPredictionSet, WorkEstimate
 from ..regions import Region
 
 
@@ -105,6 +105,40 @@ class Flux2Adapter:
             model_options=self._options(model_options, rope),
             seed=seed,
         )
+
+    def predict_regions(
+        self, *, guider, g, h, sigma, sigma_next, canvas, regions,
+        model_options, seed,
+    ) -> RegionPredictionSet:
+        terminal = float(sigma_next) == 0.0
+        qualified = (
+            terminal
+            and tuple(h.shape) == (1, 128, 128, 256)
+            and tuple(g.shape) == (1, 128, 96, 192)
+            and len(regions) == 55
+            and all((r.height, r.width) == (32, 32) for r in regions)
+        )
+        if qualified:
+            from .flux2_executor import Flux2BlockExecutor
+
+            return Flux2BlockExecutor(self).predict_regions(
+                guider=guider, g=g, h=h, sigma=sigma, canvas=canvas,
+                regions=regions, model_options=model_options, seed=seed,
+            )
+
+        predictions = []
+        for region in regions:
+            view = h[:, :, region.y:region.y2, region.x:region.x2]
+            predictions.append(self.predict_region(
+                guider=guider, h_view=view, sigma=sigma, canvas=canvas,
+                region=region, model_options=model_options, seed=seed,
+            ))
+        return RegionPredictionSet(tuple(predictions), {
+            "terminal_context_source_performed": False,
+            "terminal_context_source_blocks": 0,
+            "terminal_global_prediction_performed": False,
+            "source_final_projection_performed": False,
+        })
 
     def describe_work(self, *, global_shape, crops) -> WorkEstimate:
         global_tokens = global_shape[-2] * global_shape[-1]

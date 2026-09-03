@@ -15,6 +15,12 @@ class WorkEstimate:
     model_predictions: int
 
 
+@dataclass(frozen=True)
+class RegionPredictionSet:
+    predictions: tuple[torch.Tensor, ...]
+    telemetry: dict[str, Any]
+
+
 class ModelFamilyAdapter(Protocol):
     family: str
 
@@ -51,6 +57,20 @@ class ModelFamilyAdapter(Protocol):
         model_options: dict[str, Any],
         seed: int,
     ) -> torch.Tensor: ...
+
+    def predict_regions(
+        self,
+        *,
+        guider: Any,
+        g: torch.Tensor,
+        h: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        canvas: tuple[int, int],
+        regions: tuple[Region, ...],
+        model_options: dict[str, Any],
+        seed: int,
+    ) -> RegionPredictionSet: ...
 
     def describe_work(
         self, *, global_shape: tuple[int, ...], crops: tuple[Region, ...]

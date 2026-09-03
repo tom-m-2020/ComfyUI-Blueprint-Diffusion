@@ -119,20 +119,26 @@ class BlueprintCoordinator:
                 model_options=model_options,
                 seed=seed,
             )
-        local_predictions = []
         for region in regions:
             view = state.h[:, :, region.y:region.y2, region.x:region.x2]
             if view.untyped_storage().data_ptr() != state.h.untyped_storage().data_ptr():
                 raise RuntimeError(f"Crop {region.index} is not a view of accepted H.")
-            local_predictions.append(self.adapter.predict_region(
-                guider=guider,
-                h_view=view,
-                sigma=sigma,
-                canvas=tuple(state.h.shape[-2:]),
-                region=region,
-                model_options=model_options,
-                seed=seed,
-            ))
+        region_set = self.adapter.predict_regions(
+            guider=guider,
+            g=state.g,
+            h=state.h,
+            sigma=sigma,
+            sigma_next=sigma_next,
+            canvas=tuple(state.h.shape[-2:]),
+            regions=regions,
+            model_options=model_options,
+            seed=seed,
+        )
+        local_predictions = region_set.predictions
+        if len(local_predictions) != len(regions):
+            raise RuntimeError(
+                "Blueprint adapter returned an incomplete region prediction set."
+            )
         if not torch.equal(state.h, accepted_h_snapshot) or not torch.equal(state.g, accepted_g_snapshot):
             raise RuntimeError("A Blueprint model call mutated accepted state.")
 
@@ -192,7 +198,7 @@ class BlueprintCoordinator:
         work = self.adapter.describe_work(
             global_shape=tuple(state.g.shape), crops=regions
         )
-        self.telemetry.append({
+        interval_telemetry = {
             "event": "accepted_interval",
             "ordinal": ordinal,
             "evaluation_id": evaluation_id,
@@ -215,7 +221,9 @@ class BlueprintCoordinator:
             "invariant_max_abs": invariant_error,
             "accepted_H": _summary(next_state.h),
             "accepted_G": _summary(next_state.g),
-        })
+        }
+        interval_telemetry.update(region_set.telemetry)
+        self.telemetry.append(interval_telemetry)
         return next_state, x0_h
 
 
