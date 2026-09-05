@@ -57,12 +57,12 @@ class Flux2TerminalResamplingAdapter:
                 raise ValueError("Blueprint Terminal Resampling received reference/edit conditioning.")
 
     def validate_prepared(
-        self, *, guider, model_options, destination, model_sampling
+        self, *, guider, model_options, destination, model_sampling, destination_hw
     ) -> None:
         self._validate_conditioning(guider)
         self._validate_options(model_options)
-        if tuple(destination.shape) != (1, 128, 128, 256):
-            raise ValueError("Blueprint Terminal Resampling requires [1,128,128,256].")
+        if tuple(destination.shape) != (1, 128, *destination_hw):
+            raise ValueError("Blueprint Terminal Resampling received an invalid destination shape.")
         if "CONST" not in {item.__name__ for item in type(model_sampling).__mro__}:
             raise ValueError("Blueprint Terminal Resampling requires CONST flow sampling.")
         if float(getattr(model_sampling, "noise_scale", 1.0)) != 1.0:
@@ -123,4 +123,3 @@ class Flux2TerminalResamplingAdapter:
         options["transformer_options"] = model_options.get("transformer_options", {}).copy()
         options["transformer_options"].pop("rope_options", None)
         return guider(value, sigma.expand(1), model_options=options, seed=seed)
-

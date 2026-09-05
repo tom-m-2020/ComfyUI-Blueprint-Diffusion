@@ -42,19 +42,37 @@ class TerminalResamplingGeometry:
     stride_hw: tuple[int, int] = (24, 24)
     working_hw: tuple[int, int] = (64, 64)
 
-    def validate(self) -> None:
-        expected = ((32, 64), (128, 256), (32, 32), (24, 24), (64, 64))
-        actual = (
-            self.blueprint_hw,
-            self.destination_hw,
-            self.region_hw,
-            self.stride_hw,
-            self.working_hw,
-        )
-        if actual != expected:
+    QUALIFIED_PROFILES = {
+        (128, 256): (32, 64),
+        (128, 192): (36, 54),
+        (128, 128): (45, 45),
+        (256, 128): (64, 32),
+    }
+
+    @classmethod
+    def for_destination(cls, destination_hw: tuple[int, int]) -> "TerminalResamplingGeometry":
+        destination_hw = tuple(int(value) for value in destination_hw)
+        try:
+            blueprint_hw = cls.QUALIFIED_PROFILES[destination_hw]
+        except KeyError as error:
+            supported = ", ".join(f"{h}x{w}" for h, w in cls.QUALIFIED_PROFILES)
             raise ValueError(
-                "Blueprint Terminal Resampling supports only B=32x64, "
-                "H=128x256, region=32x32/stride24, and W=64x64."
+                f"Unsupported terminal-resampling destination {destination_hw}; "
+                f"qualified latent geometries are {supported}."
+            ) from error
+        return cls(blueprint_hw=blueprint_hw, destination_hw=destination_hw)
+
+    def validate(self) -> None:
+        expected_blueprint = self.QUALIFIED_PROFILES.get(self.destination_hw)
+        if (
+            expected_blueprint != self.blueprint_hw
+            or self.region_hw != (32, 32)
+            or self.stride_hw != (24, 24)
+            or self.working_hw != (64, 64)
+        ):
+            raise ValueError(
+                "Blueprint Terminal Resampling requires a qualified finite geometry "
+                "profile with region=32x32/stride24 and W=64x64."
             )
 
     @staticmethod
@@ -73,8 +91,6 @@ class TerminalResamplingGeometry:
             Region(index, y, x, *self.region_hw)
             for index, (y, x) in enumerate((y, x) for y in ys for x in xs)
         )
-        if len(regions) != 55:
-            raise RuntimeError(f"Qualified terminal plan requires 55 regions, got {len(regions)}.")
         return regions
 
 
@@ -98,22 +114,50 @@ def tensor_hash(value: torch.Tensor) -> str:
 def initialize_blueprint(
     seed: int,
     *,
+    geometry: TerminalResamplingGeometry | None = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    geometry = geometry or TerminalResamplingGeometry()
+    geometry.validate()
     high_generator = torch.Generator(device="cpu").manual_seed(int(seed))
     construction = torch.randn(
-        (1, 128, 128, 256), generator=high_generator, dtype=torch.float32
+        (1, 128, *geometry.destination_hw), generator=high_generator, dtype=torch.float32
     ).to(device=device, dtype=dtype)
-    coarse = F.avg_pool2d(construction, 4, 4)
+    divisible = all(
+        destination % blueprint == 0
+        for destination, blueprint in zip(geometry.destination_hw, geometry.blueprint_hw)
+    )
+    if divisible:
+        scale_y = geometry.destination_hw[0] // geometry.blueprint_hw[0]
+        scale_x = geometry.destination_hw[1] // geometry.blueprint_hw[1]
+        coarse = F.avg_pool2d(construction, (scale_y, scale_x), (scale_y, scale_x))
+        coarse_variance = 1.0 / (scale_y * scale_x)
+    else:
+        coarse = F.adaptive_avg_pool2d(construction, geometry.blueprint_hw)
+        counts = []
+        for destination, blueprint in zip(geometry.destination_hw, geometry.blueprint_hw):
+            axis_counts = [
+                math.ceil((index + 1) * destination / blueprint)
+                - math.floor(index * destination / blueprint)
+                for index in range(blueprint)
+            ]
+            counts.append(torch.tensor(axis_counts, device=device, dtype=dtype))
+        coarse_variance = (
+            counts[0].reciprocal()[:, None] * counts[1].reciprocal()[None, :]
+        )[None, None]
     del construction
     blueprint_generator = torch.Generator(device="cpu").manual_seed(
         int(seed) + 20_000_003
     )
     independent = torch.randn(
-        (1, 128, 32, 64), generator=blueprint_generator, dtype=torch.float32
+        (1, 128, *geometry.blueprint_hw), generator=blueprint_generator, dtype=torch.float32
     ).to(device=device, dtype=dtype)
-    blueprint = coarse + math.sqrt(15.0 / 16.0) * independent
+    if isinstance(coarse_variance, float):
+        independent_scale = math.sqrt(1.0 - coarse_variance)
+    else:
+        independent_scale = torch.sqrt(1.0 - coarse_variance)
+    blueprint = coarse + independent_scale * independent
     return blueprint
 
 
@@ -226,11 +270,12 @@ class TerminalResamplingProcedure(comfy.samplers.Sampler):
         seed: int,
         capture: Callable[[str, int, torch.Tensor], None] | None = None,
         adapter: Any | None = None,
+        geometry: TerminalResamplingGeometry | None = None,
     ) -> None:
         self.seed = int(seed)
         self.capture = capture
         self.adapter = adapter or Flux2TerminalResamplingAdapter()
-        self.geometry = TerminalResamplingGeometry()
+        self.geometry = geometry or TerminalResamplingGeometry()
         self.telemetry: dict[str, Any] = {}
         self.run_id = uuid.uuid4().hex
 
@@ -259,8 +304,11 @@ class TerminalResamplingProcedure(comfy.samplers.Sampler):
         validate_terminal_schedule(sigmas)
         if denoise_mask is not None:
             raise ValueError("Blueprint Terminal Resampling does not support masks.")
-        if latent_image is None or tuple(latent_image.shape) != (1, 128, 128, 256):
-            raise ValueError("Blueprint Terminal Resampling requires destination [1,128,128,256].")
+        expected_destination_shape = (1, 128, *self.geometry.destination_hw)
+        if latent_image is None or tuple(latent_image.shape) != expected_destination_shape:
+            raise ValueError(
+                f"Blueprint Terminal Resampling requires destination {expected_destination_shape}."
+            )
         if getattr(latent_image, "is_nested", False) or getattr(noise, "is_nested", False):
             raise ValueError("Blueprint Terminal Resampling does not support nested latents.")
         if bool(torch.count_nonzero(latent_image)):
@@ -273,10 +321,13 @@ class TerminalResamplingProcedure(comfy.samplers.Sampler):
             model_options=extra_args["model_options"],
             destination=latent_image,
             model_sampling=model_sampling,
+            destination_hw=self.geometry.destination_hw,
         )
 
         device = latent_image.device
-        blueprint = initialize_blueprint(self.seed, device=device, dtype=torch.float32)
+        blueprint = initialize_blueprint(
+            self.seed, geometry=self.geometry, device=device, dtype=torch.float32
+        )
         state = BlueprintRunState(blueprint, float(sigmas[0]), 0, f"{self.run_id}:initial")
         self._capture("initial_B", -1, state.blueprint)
         blueprint_calls = 0
@@ -409,6 +460,10 @@ class TerminalResamplingProcedure(comfy.samplers.Sampler):
                 "blueprint_predictions": blueprint_calls,
                 "local_predictions": local_calls,
                 "destination_model_predictions": 0,
+                "blueprint_hw": self.geometry.blueprint_hw,
+                "destination_hw": self.geometry.destination_hw,
+                "working_hw": self.geometry.working_hw,
+                "blueprint_tokens": self.geometry.blueprint_hw[0] * self.geometry.blueprint_hw[1],
                 "regions": region_records,
                 "coverage_min": float(coverage.min()),
                 "coverage_max": float(coverage.max()),
