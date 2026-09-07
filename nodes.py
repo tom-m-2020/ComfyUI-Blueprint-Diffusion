@@ -9,8 +9,10 @@ from .terminal_resampling import (
     validate_terminal_schedule,
 )
 from .configurable_resampling import (
+    FLUX2_PIXEL_SCALE,
     ConfigurableResamplingGeometry,
     ConfigurableResamplingProcedure,
+    geometry_from_pixels,
 )
 
 
@@ -174,14 +176,98 @@ class BlueprintConfigurablePrototype:
         return output, output.copy()
 
 
+class BlueprintDiffusion(BlueprintConfigurablePrototype):
+    @classmethod
+    def INPUT_TYPES(cls):
+        pixel = {"min": 256, "max": 8192, "step": 16, "advanced": True}
+        working = {"min": 512, "max": 1024, "step": 16, "advanced": True}
+        return {"required": {
+            "guider": ("GUIDER", {"tooltip": "Prepared FLUX.2 Klein 4B BasicGuider. CFG must be 1."}),
+            "sigmas": ("SIGMAS", {"tooltip": "Qualified four-step whole-scene Blueprint schedule."}),
+            "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                                     "control_after_generate": True,
+                                     "tooltip": "Deterministically derives the Blueprint and every regional noise field."}),
+            "destination": ("LATENT", {"tooltip": "Empty FLUX.2 destination latent. Its pixel width and height define H automatically."}),
+            "geometry_mode": (["auto", "manual"], {
+                "tooltip": "Auto selects only a live-qualified destination profile. Manual uses the pixel controls below."
+            }),
+            "blueprint_width": ("INT", {**pixel, "default": 720, "max": 1024,
+                "tooltip": "G width in pixels: bounded whole-scene planning canvas. Used only in manual mode."}),
+            "blueprint_height": ("INT", {**pixel, "default": 720, "max": 1024,
+                "tooltip": "G height in pixels: bounded whole-scene planning canvas. Used only in manual mode."}),
+            "tile_width": ("INT", {**pixel, "default": 512,
+                "tooltip": "F width in pixels: portion written into the final destination by each local result."}),
+            "tile_height": ("INT", {**pixel, "default": 512,
+                "tooltip": "F height in pixels: portion written into the final destination by each local result."}),
+            "tile_overlap_x": ("INT", {"default": 256, "min": 0, "max": 8176, "step": 16,
+                "advanced": True, "tooltip": "Shared destination pixels between neighboring footprints on X; stride is tile width minus overlap."}),
+            "tile_overlap_y": ("INT", {"default": 256, "min": 0, "max": 8176, "step": 16,
+                "advanced": True, "tooltip": "Shared destination pixels between neighboring footprints on Y; stride is tile height minus overlap."}),
+            "working_width": ("INT", {**working, "default": 1024,
+                "tooltip": "W width in pixels: bounded local canvas seen by the diffusion model; must be an integer enlargement of F."}),
+            "working_height": ("INT", {**working, "default": 1024,
+                "tooltip": "W height in pixels: bounded local canvas seen by the diffusion model; must be an integer enlargement of F."}),
+            "refinement_sigma": ("FLOAT", {"default": 0.25, "min": 0.10, "max": 0.50,
+                "step": 0.01, "round": 0.001,
+                "tooltip": "Late-noise strength for the single local [sigma, 0] refinement interval."}),
+        }}
+
+    DESCRIPTION = (
+        "Blueprint Diffusion terminal-refinement release: G is the bounded whole-scene planning canvas; "
+        "F is the destination footprint written by one tile; W is the bounded local canvas seen by the "
+        "diffusion model; overlap is the shared destination area between footprints. Pixel controls use "
+        "FLUX.2's 16x latent scale. Auto mode selects only qualified profiles."
+    )
+
+    def sample(self, guider, sigmas, noise_seed, destination, geometry_mode,
+               blueprint_width, blueprint_height, tile_width, tile_height,
+               tile_overlap_x, tile_overlap_y, working_width, working_height,
+               refinement_sigma):
+        samples = destination.get("samples") if isinstance(destination, dict) else None
+        if not isinstance(samples, torch.Tensor) or samples.ndim != 4:
+            raise ValueError("Blueprint Diffusion requires a LATENT samples tensor to derive destination H.")
+        geometry = geometry_from_pixels(
+            tuple(samples.shape[-2:]), geometry_mode,
+            blueprint_width=blueprint_width, blueprint_height=blueprint_height,
+            tile_width=tile_width, tile_height=tile_height,
+            tile_overlap_x=tile_overlap_x, tile_overlap_y=tile_overlap_y,
+            working_width=working_width, working_height=working_height,
+        )
+        output, denoised = super().sample(
+            guider, sigmas, noise_seed, destination,
+            geometry.blueprint_hw[1], geometry.blueprint_hw[0],
+            geometry.footprint_hw[1], geometry.footprint_hw[0],
+            geometry.stride_hw[1], geometry.stride_hw[0],
+            geometry.working_hw[1], geometry.working_hw[0], refinement_sigma,
+        )
+        telemetry = output["blueprint_configurable_telemetry"]
+        telemetry["user_geometry_mode"] = geometry_mode
+        telemetry["pixel_scale"] = FLUX2_PIXEL_SCALE
+        telemetry["resolved_pixels"] = {
+            "destination": {"width": geometry.destination_hw[1] * FLUX2_PIXEL_SCALE,
+                            "height": geometry.destination_hw[0] * FLUX2_PIXEL_SCALE},
+            "blueprint": {"width": geometry.blueprint_hw[1] * FLUX2_PIXEL_SCALE,
+                          "height": geometry.blueprint_hw[0] * FLUX2_PIXEL_SCALE},
+            "footprint": {"width": geometry.footprint_hw[1] * FLUX2_PIXEL_SCALE,
+                          "height": geometry.footprint_hw[0] * FLUX2_PIXEL_SCALE},
+            "overlap": {"x": (geometry.footprint_hw[1] - geometry.stride_hw[1]) * FLUX2_PIXEL_SCALE,
+                        "y": (geometry.footprint_hw[0] - geometry.stride_hw[0]) * FLUX2_PIXEL_SCALE},
+            "working": {"width": geometry.working_hw[1] * FLUX2_PIXEL_SCALE,
+                        "height": geometry.working_hw[0] * FLUX2_PIXEL_SCALE},
+        }
+        return output, denoised
+
+
 NODE_CLASS_MAPPINGS = {
     "BlueprintCandidate3EulerSampler": BlueprintCandidate3EulerSampler,
     "BlueprintTerminalResampling": BlueprintTerminalResampling,
     "BlueprintConfigurablePrototype": BlueprintConfigurablePrototype,
+    "BlueprintDiffusion": BlueprintDiffusion,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BlueprintCandidate3EulerSampler": "Blueprint Candidate-3 Euler Sampler",
     "BlueprintTerminalResampling": "Blueprint Terminal Resampling",
     "BlueprintConfigurablePrototype": "Blueprint Configurable Prototype",
+    "BlueprintDiffusion": "Blueprint Diffusion (Terminal Refine)",
 }

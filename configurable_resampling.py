@@ -26,6 +26,16 @@ from .terminal_resampling import (
 )
 
 
+FLUX2_PIXEL_SCALE = 16
+AUTO_GEOMETRY_PROFILES = {
+    (128, 128): ((45, 45), (32, 32), (16, 16), (64, 64)),
+    (256, 256): ((48, 48), (32, 32), (24, 24), (64, 64)),
+    (128, 256): ((32, 64), (32, 32), (24, 24), (64, 64)),
+    (192, 128): ((48, 32), (32, 32), (24, 24), (64, 64)),
+    (128, 192): ((32, 48), (32, 32), (24, 24), (64, 64)),
+}
+
+
 @dataclass(frozen=True)
 class ConfigurableResamplingGeometry:
     blueprint_hw: tuple[int, int]
@@ -38,19 +48,42 @@ class ConfigurableResamplingGeometry:
         values = (*self.blueprint_hw, *self.destination_hw, *self.footprint_hw,
                   *self.stride_hw, *self.working_hw)
         if any(type(value) is not int or value <= 0 for value in values):
-            raise ValueError("Configurable Blueprint geometry requires positive integer dimensions.")
-        if any(value < 16 or value > 64 for value in self.blueprint_hw) or math.prod(self.blueprint_hw) > 4096:
-            raise ValueError("Blueprint G axes must be 16..64 with at most 4096 latent cells.")
+            raise ValueError("Every Blueprint geometry dimension must be a positive integer.")
+        if any(value < 16 or value > 64 for value in self.blueprint_hw):
+            raise ValueError(
+                f"Blueprint grid {self.blueprint_hw} is outside the qualified 16..64 latent-cell axes."
+            )
+        if math.prod(self.blueprint_hw) > 4096:
+            raise ValueError(
+                f"Blueprint grid {self.blueprint_hw} exceeds the qualified bounded model area "
+                f"of 4096 latent cells (got {math.prod(self.blueprint_hw)})."
+            )
         if any(value < 16 or value > 512 for value in self.destination_hw):
-            raise ValueError("Destination H axes must be 16..512 latent cells.")
+            raise ValueError(
+                f"Destination grid {self.destination_hw} is outside the qualified 16..512 latent-cell axes."
+            )
         if any(f > h for f, h in zip(self.footprint_hw, self.destination_hw)):
-            raise ValueError("Destination footprint F must fit inside H.")
+            raise ValueError(
+                f"Destination footprint {self.footprint_hw} must fit inside destination {self.destination_hw}."
+            )
         if any(s > f for s, f in zip(self.stride_hw, self.footprint_hw)):
-            raise ValueError("Stride must not exceed its footprint axis.")
-        if any(value < 32 or value > 64 for value in self.working_hw) or math.prod(self.working_hw) > 4096:
-            raise ValueError("Working W axes must be 32..64 with at most 4096 latent cells.")
+            raise ValueError(
+                f"Stride {self.stride_hw} must not exceed footprint {self.footprint_hw}."
+            )
+        if any(value < 32 or value > 64 for value in self.working_hw):
+            raise ValueError(
+                f"Working canvas {self.working_hw} is outside the qualified 32..64 latent-cell axes."
+            )
+        if math.prod(self.working_hw) > 4096:
+            raise ValueError(
+                f"Working canvas {self.working_hw} exceeds the qualified bounded model area "
+                f"of 4096 latent cells (got {math.prod(self.working_hw)})."
+            )
         if any(w < f or w % f for w, f in zip(self.working_hw, self.footprint_hw)):
-            raise ValueError("W must be an integer nearest-neighbor upscale of F on each axis.")
+            raise ValueError(
+                f"Working canvas {self.working_hw} must be an integer enlargement of destination "
+                f"footprint {self.footprint_hw} on each axis."
+            )
 
     @staticmethod
     def _starts(length: int, size: int, stride: int) -> tuple[int, ...]:
@@ -64,10 +97,17 @@ class ConfigurableResamplingGeometry:
         self.validate()
         ys = self._starts(self.destination_hw[0], self.footprint_hw[0], self.stride_hw[0])
         xs = self._starts(self.destination_hw[1], self.footprint_hw[1], self.stride_hw[1])
-        return tuple(
+        regions = tuple(
             Region(index, y, x, *self.footprint_hw)
             for index, (y, x) in enumerate((y, x) for y in ys for x in xs)
         )
+        if (ys[0] != 0 or xs[0] != 0
+                or ys[-1] + self.footprint_hw[0] != self.destination_hw[0]
+                or xs[-1] + self.footprint_hw[1] != self.destination_hw[1]
+                or any(right - left > self.footprint_hw[0] for left, right in zip(ys[:-1], ys[1:]))
+                or any(right - left > self.footprint_hw[1] for left, right in zip(xs[:-1], xs[1:]))):
+            raise ValueError("Destination geometry cannot be completely covered by the planned footprints.")
+        return regions
 
     def is_frozen_oracle(self, refinement_sigma: float) -> bool:
         return (
@@ -84,6 +124,65 @@ def validate_refinement_sigma(value: float) -> float:
     if not math.isfinite(value) or not 0.10 <= value <= 0.50:
         raise ValueError("Configurable Blueprint refinement sigma must be within [0.10, 0.50].")
     return value
+
+
+def _pixels_to_latent(name: str, value: int) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive pixel integer, got {value!r}.")
+    if value % FLUX2_PIXEL_SCALE:
+        raise ValueError(
+            f"{name} must be divisible by {FLUX2_PIXEL_SCALE} pixels for FLUX.2; got {value}."
+        )
+    return value // FLUX2_PIXEL_SCALE
+
+
+def geometry_from_pixels(
+    destination_hw: tuple[int, int], geometry_mode: str, *,
+    blueprint_width: int, blueprint_height: int,
+    tile_width: int, tile_height: int,
+    tile_overlap_x: int, tile_overlap_y: int,
+    working_width: int, working_height: int,
+) -> ConfigurableResamplingGeometry:
+    if geometry_mode == "auto":
+        profile = AUTO_GEOMETRY_PROFILES.get(destination_hw)
+        if profile is None:
+            supported = ", ".join(
+                f"{width * FLUX2_PIXEL_SCALE}x{height * FLUX2_PIXEL_SCALE}"
+                for height, width in AUTO_GEOMETRY_PROFILES
+            )
+            actual = f"{destination_hw[1] * FLUX2_PIXEL_SCALE}x{destination_hw[0] * FLUX2_PIXEL_SCALE}"
+            raise ValueError(
+                f"Auto geometry has no qualified profile for destination {actual} pixels. "
+                f"Supported auto destinations: {supported}. Use manual mode for other qualified geometry."
+            )
+        geometry = ConfigurableResamplingGeometry(profile[0], destination_hw,
+                                                   profile[1], profile[2], profile[3])
+        geometry.validate()
+        return geometry
+    if geometry_mode != "manual":
+        raise ValueError(f"Geometry mode must be 'auto' or 'manual', got {geometry_mode!r}.")
+
+    blueprint_hw = (_pixels_to_latent("Blueprint height", blueprint_height),
+                    _pixels_to_latent("Blueprint width", blueprint_width))
+    footprint_hw = (_pixels_to_latent("Tile height", tile_height),
+                    _pixels_to_latent("Tile width", tile_width))
+    working_hw = (_pixels_to_latent("Working height", working_height),
+                  _pixels_to_latent("Working width", working_width))
+    overlap_hw = (_pixels_to_latent("Tile overlap Y", tile_overlap_y)
+                  if tile_overlap_y else 0,
+                  _pixels_to_latent("Tile overlap X", tile_overlap_x)
+                  if tile_overlap_x else 0)
+    if any(overlap >= footprint for overlap, footprint in zip(overlap_hw, footprint_hw)):
+        raise ValueError(
+            f"Tile overlap {(tile_overlap_y, tile_overlap_x)} pixels must be smaller than "
+            f"tile footprint {(tile_height, tile_width)} pixels on each axis."
+        )
+    stride_hw = tuple(footprint - overlap for footprint, overlap in zip(footprint_hw, overlap_hw))
+    geometry = ConfigurableResamplingGeometry(blueprint_hw, destination_hw,
+                                               footprint_hw, stride_hw, working_hw)
+    geometry.validate()
+    geometry.regions()
+    return geometry
 
 
 def initialize_configurable_blueprint(seed: int, geometry: ConfigurableResamplingGeometry,
