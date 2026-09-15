@@ -1,18 +1,23 @@
+import comfy.model_management
 import torch
 
-import comfy.model_management
-
-from .sampling.euler import BlueprintEulerSampler
-from .terminal_resampling import (
-    TerminalResamplingGeometry,
-    TerminalResamplingProcedure,
-    validate_terminal_schedule,
-)
 from .configurable_resampling import (
     FLUX2_PIXEL_SCALE,
     ConfigurableResamplingGeometry,
     ConfigurableResamplingProcedure,
     geometry_from_pixels,
+)
+from .drift_constraints import (
+    MODES,
+    DriftConstrainedEuler,
+    DriftConstraintNoise,
+    make_policy,
+)
+from .sampling.euler import BlueprintEulerSampler
+from .terminal_resampling import (
+    TerminalResamplingGeometry,
+    TerminalResamplingProcedure,
+    validate_terminal_schedule,
 )
 
 
@@ -33,6 +38,71 @@ class BlueprintCandidate3EulerSampler:
 
     def build(self):
         return (BlueprintEulerSampler(),)
+
+
+class DriftConstrainedSampling:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source": ("LATENT",),
+                "mode": (MODES,),
+                "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                                       "control_after_generate": True}),
+                "radius": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 64.0,
+                                      "step": 0.25}),
+                "transition_bandwidth": ("FLOAT", {"default": 2.0, "min": 0.01,
+                                                    "max": 64.0, "step": 0.01}),
+                "downsample_factor": ("INT", {"default": 4, "min": 1, "max": 64,
+                                               "step": 1}),
+                "alpha": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                                     "step": 0.01}),
+                "normalized_threshold": ("FLOAT", {"default": 5.0 / 63.0, "min": 0.0,
+                                                    "max": 2.0, "step": 0.001}),
+                "calibration_start": ("FLOAT", {"default": 0.0, "min": 0.0,
+                                                 "max": 1.0, "step": 0.01}),
+                "calibration_end": ("FLOAT", {"default": 0.5, "min": 0.0,
+                                               "max": 1.0, "step": 0.01}),
+            },
+            "optional": {"reference_conditioning": ("CONDITIONING",)},
+        }
+
+    RETURN_TYPES = ("DRIFT_CONSTRAINT", "NOISE")
+    RETURN_NAMES = ("constraint", "noise")
+    FUNCTION = "build"
+    CATEGORY = "sampling/custom_sampling/drift"
+    DESCRIPTION = (
+        "Experimental stock-Klein drift policies. FSS/ILVR do not reliably preserve "
+        "portrait identity; the tested FBSDiff adaptation was falsified."
+    )
+
+    def build(self, source, mode, noise_seed, radius, transition_bandwidth,
+              downsample_factor, alpha, normalized_threshold, calibration_start,
+              calibration_end, reference_conditioning=None):
+        policy = make_policy(
+            source, mode, noise_seed, radius, transition_bandwidth,
+            downsample_factor, alpha, normalized_threshold, calibration_start,
+            calibration_end, reference_conditioning,
+        )
+        return policy, DriftConstraintNoise(policy)
+
+
+class DriftConstrainedEulerSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"constraint": ("DRIFT_CONSTRAINT",)}}
+
+    RETURN_TYPES = ("SAMPLER",)
+    RETURN_NAMES = ("sampler",)
+    FUNCTION = "build"
+    CATEGORY = "sampling/custom_sampling/samplers"
+    DESCRIPTION = (
+        "Experimental CONST/Euler sampler for a paired Drift-Constrained Sampling policy. "
+        "Use with native SamplerCustomAdvanced."
+    )
+
+    def build(self, constraint):
+        return (DriftConstrainedEuler(constraint),)
 
 
 class BlueprintTerminalResampling:
@@ -66,7 +136,9 @@ class BlueprintTerminalResampling:
         latent = destination.copy()
         samples = latent.get("samples")
         if not isinstance(samples, torch.Tensor):
-            raise ValueError("Blueprint Terminal Resampling requires a LATENT samples tensor.")
+            raise ValueError(  # noqa: TRY004 - preserve existing public error behavior.
+                "Blueprint Terminal Resampling requires a LATENT samples tensor."
+            )
         if "noise_mask" in latent:
             raise ValueError("Blueprint Terminal Resampling does not support masks.")
         if samples.ndim != 4 or samples.shape[0] != 1 or samples.shape[1] != 128:
@@ -259,6 +331,8 @@ class BlueprintDiffusion(BlueprintConfigurablePrototype):
 
 
 NODE_CLASS_MAPPINGS = {
+    "DriftConstrainedSampling": DriftConstrainedSampling,
+    "DriftConstrainedEulerSampler": DriftConstrainedEulerSampler,
     "BlueprintCandidate3EulerSampler": BlueprintCandidate3EulerSampler,
     "BlueprintTerminalResampling": BlueprintTerminalResampling,
     "BlueprintConfigurablePrototype": BlueprintConfigurablePrototype,
@@ -266,6 +340,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "DriftConstrainedSampling": "Drift-Constrained Sampling",
+    "DriftConstrainedEulerSampler": "Drift-Constrained Euler Sampler",
     "BlueprintCandidate3EulerSampler": "Blueprint Candidate-3 Euler Sampler",
     "BlueprintTerminalResampling": "Blueprint Terminal Resampling",
     "BlueprintConfigurablePrototype": "Blueprint Configurable Prototype",
