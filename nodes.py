@@ -45,14 +45,17 @@ class DriftConstrainedSampling:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "model": ("MODEL",),
                 "source": ("LATENT",),
                 "mode": (MODES,),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
                                        "control_after_generate": True}),
                 "radius": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 64.0,
-                                      "step": 0.25}),
+                                      "step": 0.25,
+                                      "tooltip": "Absolute latent-frequency bins; default was tested only on Klein."}),
                 "transition_bandwidth": ("FLOAT", {"default": 2.0, "min": 0.01,
-                                                    "max": 64.0, "step": 0.01}),
+                                                    "max": 64.0, "step": 0.01,
+                                                    "tooltip": "Absolute latent-frequency bins; no model/resolution scaling is applied."}),
                 "downsample_factor": ("INT", {"default": 4, "min": 1, "max": 64,
                                                "step": 1}),
                 "alpha": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
@@ -72,15 +75,16 @@ class DriftConstrainedSampling:
     FUNCTION = "build"
     CATEGORY = "sampling/custom_sampling/drift"
     DESCRIPTION = (
-        "Experimental stock-Klein drift policies. FSS/ILVR do not reliably preserve "
-        "portrait identity; the tested FBSDiff adaptation was falsified."
+        "Model-aware endpoint policies. FSS NOISE supports qualified Klein, Z-Image, "
+        "and Anima image latent contracts with ordinary native samplers. ILVR and "
+        "FBSDiff remain experimental stock-Klein Euler modes."
     )
 
-    def build(self, source, mode, noise_seed, radius, transition_bandwidth,
+    def build(self, model, source, mode, noise_seed, radius, transition_bandwidth,
               downsample_factor, alpha, normalized_threshold, calibration_start,
               calibration_end, reference_conditioning=None):
         policy = make_policy(
-            source, mode, noise_seed, radius, transition_bandwidth,
+            model, source, mode, noise_seed, radius, transition_bandwidth,
             downsample_factor, alpha, normalized_threshold, calibration_start,
             calibration_end, reference_conditioning,
         )
@@ -102,6 +106,8 @@ class DriftConstrainedEulerSampler:
     )
 
     def build(self, constraint):
+        if constraint.model_contract.family != "flux2_klein":
+            raise TypeError("Drift-Constrained Euler remains FLUX.2 Klein-only; use FSS NOISE with an ordinary native sampler.")
         return (DriftConstrainedEuler(constraint),)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
+import weakref
 from dataclasses import dataclass, field
 from itertools import pairwise
 
@@ -61,6 +62,10 @@ class DriftConstraintPolicy:
     source: torch.Tensor = field(compare=False, repr=False)
     source_fingerprint: str
     processed_source_fingerprint: str
+    raw_source: torch.Tensor = field(compare=False, repr=False)
+    raw_source_fingerprint: str
+    model_contract: ModelContract
+    model_ref: object = field(compare=False, repr=False)
     batch_index: tuple[int, ...] | None
     noise_seed: int
     pair_id: str
@@ -70,14 +75,134 @@ class DriftConstraintPolicy:
     fbsdiff: FBSDiffConfig | None = None
 
 
+@dataclass(frozen=True)
+class ModelContract:
+    family: str
+    model_class: str
+    config_class: str
+    latent_format_class: str
+    latent_channels: int
+    latent_dimensions: int
+    sampling_class: str
+    sampling_object_id: int
+    sampling_parameters: tuple[tuple[str, float], ...]
+
+
 def validate_source_tensor(source: object) -> torch.Tensor:
-    if not isinstance(source, torch.Tensor) or source.ndim != 4:
-        raise ValueError("Drift-Constrained Sampling requires a non-nested [B,C,H,W] source LATENT tensor.")
+    if not isinstance(source, torch.Tensor) or source.ndim not in {4, 5}:
+        raise ValueError(
+            "Drift-Constrained Sampling requires a non-nested [B,C,H,W] or "
+            "[B,C,T,H,W] source LATENT tensor."
+        )
     if getattr(source, "is_nested", False):
         raise ValueError("Drift-Constrained Sampling does not support nested latents.")
     if not bool(torch.isfinite(source).all()):
         raise ValueError("Drift-Constrained Sampling source must be finite.")
     return source
+
+
+def _sampling_parameters(model_sampling: object) -> tuple[tuple[str, float], ...]:
+    values = []
+    for name in ("shift", "multiplier", "noise_scale"):
+        if hasattr(model_sampling, name):
+            values.append((name, float(getattr(model_sampling, name))))
+    return tuple(values)
+
+
+def inspect_model_contract(model: object) -> ModelContract:
+    if not hasattr(model, "get_model_object") or not hasattr(model, "model"):
+        raise TypeError("Drift-Constrained Sampling requires a native ComfyUI MODEL.")
+    latent_format = model.get_model_object("latent_format")
+    model_sampling = model.get_model_object("model_sampling")
+    base_model = model.model
+    config = getattr(base_model, "model_config", None)
+    config_class = type(config).__name__
+    model_class = type(base_model).__name__
+    latent_class = type(latent_format).__name__
+    channels = int(getattr(latent_format, "latent_channels", 0))
+    dimensions = int(getattr(latent_format, "latent_dimensions", 0))
+
+    if model_class == "Flux2" and config_class == "Flux2" and latent_class == "Flux2":
+        family = "flux2_klein"
+    elif model_class == "Lumina2" and config_class == "ZImage" and latent_class == "Flux":
+        family = "z_image"
+    elif model_class == "Anima" and config_class == "Anima" and latent_class == "Wan21":
+        family = "anima"
+    else:
+        raise TypeError(
+            "FSS supports only qualified FLUX.2 Klein, stock Z-Image, and stock Anima "
+            f"image contracts; received model={model_class}, config={config_class}, "
+            f"latent_format={latent_class}."
+        )
+
+    expected = {
+        "flux2_klein": (128, 2),
+        "z_image": (16, 2),
+        "anima": (16, 3),
+    }[family]
+    if (channels, dimensions) != expected:
+        raise ValueError(
+            f"Unexpected {family} latent contract: channels/dimensions "
+            f"{channels}/{dimensions}, expected {expected[0]}/{expected[1]}."
+        )
+    sampling_name = ".".join(
+        f"{base.__module__}.{base.__qualname__}" for base in type(model_sampling).__mro__[:-1]
+    )
+    return ModelContract(
+        family=family,
+        model_class=model_class,
+        config_class=config_class,
+        latent_format_class=latent_class,
+        latent_channels=channels,
+        latent_dimensions=dimensions,
+        sampling_class=sampling_name,
+        sampling_object_id=id(model_sampling),
+        sampling_parameters=_sampling_parameters(model_sampling),
+    )
+
+
+def validate_model_contract(model: object, expected: ModelContract) -> None:
+    actual = inspect_model_contract(model)
+    if actual != expected:
+        raise ValueError("The MODEL or its latent/sampling contract changed after policy construction.")
+
+
+def canonicalize_source(
+    model: object,
+    source_latent: dict,
+    contract: ModelContract,
+    require_nonzero: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import comfy.sample
+
+    raw = validate_source_tensor(source_latent.get("samples"))
+    is_nonzero = bool(torch.count_nonzero(raw))
+    if require_nonzero and not is_nonzero:
+        raise ValueError("FSS requires a real nonzero VAE-encoded source LATENT.")
+    fixed = comfy.sample.fix_empty_latent_channels(
+        model,
+        raw.detach().clone(),
+        source_latent.get("downscale_ratio_spacial"),
+        source_latent.get("downscale_ratio_temporal"),
+    )
+    fixed = validate_source_tensor(fixed)
+    expected_rank = 5 if contract.family == "anima" else 4
+    if fixed.ndim != expected_rank or fixed.shape[1] != contract.latent_channels:
+        raise ValueError(
+            f"Canonical {contract.family} source must have rank {expected_rank} and "
+            f"{contract.latent_channels} channels; got {tuple(fixed.shape)}."
+        )
+    if contract.family == "anima" and fixed.shape[2] != 1:
+        raise ValueError("Initial Anima FSS support is image-only and requires T=1.")
+    processed = (
+        model.model.process_latent_in(fixed.detach().clone())
+        if is_nonzero else fixed.detach().clone()
+    )
+    if not isinstance(processed, torch.Tensor) or processed.shape != fixed.shape:
+        raise ValueError("MODEL process_latent_in changed the canonical source shape.")
+    if not bool(torch.isfinite(processed).all()):
+        raise ValueError("MODEL process_latent_in produced a non-finite source.")
+    return fixed.detach().clone(), processed.detach().clone()
 
 
 def validate_reference_conditioning(conditioning: object) -> None:
@@ -94,6 +219,7 @@ def validate_reference_conditioning(conditioning: object) -> None:
 
 
 def make_policy(
+    model: object,
     source_latent: dict,
     mode: str,
     noise_seed: int,
@@ -112,7 +238,16 @@ def make_policy(
         raise TypeError("source must be a LATENT dictionary.")
     if "noise_mask" in source_latent:
         raise ValueError("Drift-Constrained Sampling does not support latent noise masks.")
-    source = validate_source_tensor(source_latent.get("samples"))
+    contract = inspect_model_contract(model)
+    if contract.family != "flux2_klein" and mode not in {"none", "fss"}:
+        raise TypeError(
+            f"Mode {mode!r} remains FLUX.2 Klein-only; {contract.family} supports only "
+            "native Gaussian or FSS NOISE."
+        )
+    raw_source, source = canonicalize_source(
+        model, source_latent, contract, require_nonzero=mode in {"fss", "fss_ilvr"}
+    )
+    validate_model_contract(model, contract)
     if radius < 0 or not math.isfinite(radius):
         raise ValueError("FSS radius must be finite and nonnegative.")
     if transition_bandwidth <= 0 or not math.isfinite(transition_bandwidth):
@@ -134,9 +269,12 @@ def make_policy(
         if len(batch_index) != source.shape[0]:
             raise ValueError("source batch_index length must equal source batch size.")
     owned = source.detach().clone()
+    raw_owned = raw_source.detach().clone()
     source_hash = tensor_fingerprint(owned)
+    raw_source_hash = tensor_fingerprint(raw_owned)
     pair_id = hashlib.sha256(
-        f"{source_hash}|{noise_seed}|{mode}|{radius}|{transition_bandwidth}".encode()
+        f"{source_hash}|{raw_source_hash}|{contract}|{noise_seed}|{mode}|"
+        f"{radius}|{transition_bandwidth}|{batch_index}".encode()
     ).hexdigest()
     provenance = EndpointProvenance(pair_id)
     return DriftConstraintPolicy(
@@ -144,6 +282,10 @@ def make_policy(
         source=owned,
         source_fingerprint=source_hash,
         processed_source_fingerprint=canonical_endpoint_fingerprint(owned),
+        raw_source=raw_owned,
+        raw_source_fingerprint=raw_source_hash,
+        model_contract=contract,
+        model_ref=weakref.ref(model),
         batch_index=batch_index,
         noise_seed=int(noise_seed),
         pair_id=pair_id,
@@ -247,10 +389,16 @@ class DriftConstraintNoise:
 
         if not isinstance(input_latent, dict) or "noise_mask" in input_latent:
             raise ValueError("Drift NOISE requires the original unmasked source LATENT.")
+        model = self.policy.model_ref()
+        if model is None:
+            raise ValueError("The MODEL used to construct this drift policy is no longer available.")
+        validate_model_contract(model, self.policy.model_contract)
         if tensor_fingerprint(self.policy.source) != self.policy.source_fingerprint:
             raise ValueError("Drift policy source snapshot was mutated after construction.")
+        if tensor_fingerprint(self.policy.raw_source) != self.policy.raw_source_fingerprint:
+            raise ValueError("Drift policy raw source snapshot was mutated after construction.")
         source = validate_source_tensor(input_latent.get("samples"))
-        if tensor_fingerprint(source) != self.policy.source_fingerprint:
+        if tensor_fingerprint(source) != self.policy.raw_source_fingerprint:
             raise ValueError("Drift NOISE source differs from the policy source snapshot.")
         batch_index = input_latent.get("batch_index")
         actual_index = None if batch_index is None else tuple(int(value) for value in batch_index)
@@ -287,6 +435,8 @@ class DriftConstrainedEuler:
     def _validate_inputs(self, model, sigmas, noise, latent_image, denoise_mask) -> None:
         import comfy.model_sampling
 
+        if self.policy.model_contract.family != "flux2_klein":
+            raise TypeError("Drift-Constrained Euler remains FLUX.2 Klein-only.")
         if denoise_mask is not None:
             raise ValueError("Drift-Constrained Euler does not support noise masks.")
         validate_sigmas(sigmas)
